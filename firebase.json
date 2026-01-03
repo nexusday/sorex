@@ -1,0 +1,11 @@
+{
+  "hosting": {
+    "site": "sorexmusic",
+    "public": "public",
+    "ignore": [
+      "firebase.json",
+      "**/.*",
+      "**/node_modules/**"
+    ]
+  }
+}
