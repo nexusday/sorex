@@ -1,14 +1,14 @@
 {
   "name": "sorex",
   "version": "1.0.0",
-  "description": "Aplicación de música con autenticación",
+  "description": "sorex",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
     "dev": "nodemon index.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": ["música", "firebase", "streaming"],
+  "keywords": ["música"],
   "author": "",
   "license": "ISC",
   "dependencies": {

@@ -91,6 +91,78 @@ let currentView = 'home';
 let authUnsubscribe = null;
 let pendingUsernameResolver = null;
 
+
+const downloadCurrentSong = async () => {
+    const currentSong = SONGS[currentSongIndex];
+    if (!currentSong) return;
+
+    try {
+        
+        const downloadBtn = document.getElementById('download-btn');
+        if (downloadBtn) {
+            downloadBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+            downloadBtn.disabled = true;
+        }
+
+
+        const response = await fetch(currentSong.audio, {
+            method: 'GET',
+            mode: 'cors',
+            cache: 'no-cache'
+        });
+        
+        if (!response.ok) {
+            throw new Error('No se pudo descargar el archivo');
+        }
+        
+        const blob = await response.blob();
+        const blobUrl = window.URL.createObjectURL(blob);
+        
+        
+        const link = document.createElement('a');
+        link.href = blobUrl;
+        
+
+        const fileName = `${currentSong.artist} - ${currentSong.title}.mp3`
+            .replace(/[^a-z0-9\s\-\.]/gi, '_')
+            .replace(/\s+/g, ' ')
+            .trim();
+        
+        
+        link.download = fileName;
+        
+        
+        document.body.appendChild(link);
+        link.click();
+        
+        
+        setTimeout(() => {
+            document.body.removeChild(link);
+            window.URL.revokeObjectURL(blobUrl);
+            
+            
+            if (downloadBtn) {
+                downloadBtn.innerHTML = '<i class="fas fa-download"></i>';
+                downloadBtn.disabled = false;
+            }
+        }, 100);
+        
+    } catch (error) {
+        console.error('Error al descargar la canción:', error);
+        alert('No se pudo descargar la canción. Intenta de nuevo más tarde.');
+        
+        
+        const downloadBtn = document.getElementById('download-btn');
+        if (downloadBtn) {
+            downloadBtn.innerHTML = '<i class="fas fa-download"></i>';
+            downloadBtn.disabled = false;
+        }
+    }
+};
+
+
+window.downloadCurrentSong = downloadCurrentSong;
+
 const requestUsername = (suggested = '') => {
     return new Promise((resolve) => {
         
@@ -382,10 +454,14 @@ const updatePlayerUI = (songIndex) => {
     const playerCover = document.querySelector('.player-cover');
     const playerTitle = document.querySelector('.player-title');
     const playerArtist = document.querySelector('.player-artist');
+    const downloadBtn = document.getElementById('download-btn');
     
     if (playerCover) playerCover.src = song.cover;
     if (playerTitle) playerTitle.textContent = song.title;
     if (playerArtist) playerArtist.textContent = song.artist;
+    if (downloadBtn) {
+        downloadBtn.title = `Descargar ${song.title} - ${song.artist}`;
+    }
 };
 
 const updatePlayButton = () => {
@@ -398,7 +474,7 @@ const updatePlayButton = () => {
 };
 
 const addToRecent = (song) => {
-    // Evitar duplicados p
+    
     recentSongs = recentSongs.filter(s => s.id !== song.id);
     
 
@@ -951,7 +1027,10 @@ const initApp = () => {
             </div>
             
             <div class="player-extra">
-                <button class="control-btn">
+                <button class="control-btn" id="download-btn" title="Descargar canción" onclick="downloadCurrentSong()">
+                    <i class="fas fa-download"></i>
+                </button>
+                <button class="control-btn volume-btn">
                     <i class="fas fa-volume-up"></i>
                 </button>
             </div>
