@@ -1,6 +1,6 @@
 const LOGO_URL = "https://i.ibb.co/GfG3bg4D/Background-Eraser-20251204-190859969.png";
 
-const SONGS = [
+const PRESET_SONGS = [
     {
         title: "El Año Entero",
         artist: "Dani Venz",
@@ -80,21 +80,102 @@ const SONGS = [
     }
 ];
 
+let songs = [...PRESET_SONGS];
 let currentSongIndex = 0;
 let isPlaying = false;
 let currentAudio = null;
 let currentUser = null;
 let favorites = [];
 let recentSongs = [];
-let playlists = [];
 let currentView = 'home';
 let authUnsubscribe = null;
 let pendingUsernameResolver = null;
+let songsUnsubscribe = null;
+let pendingUploadModal = null;
+let pendingUploadSubmit = false;
+let toastContainer = null;
+const mediaCache = new Map();
+const MAX_AUDIO_MB = 8;
+const SONGS_META_PATH = 'songs/meta';
+const SONGS_MEDIA_PATH = 'songs/media';
+let pendingUploads = [];
+let lastStatusMap = {};
+const PENDING_UPLOADS_KEY = 'pendingUploads';
+const READY_STATUS = 'ready';
+const PROCESSING_STATUS = 'processing';
 
+const ensureToastContainer = () => {
+    if (toastContainer && document.body.contains(toastContainer)) return toastContainer;
+    toastContainer = document.createElement('div');
+    toastContainer.className = 'toast-container';
+    document.body.appendChild(toastContainer);
+    return toastContainer;
+};
+
+const showToast = (message, type = 'info', duration = 3200) => {
+    const container = ensureToastContainer();
+    const toast = document.createElement('div');
+    toast.className = `toast toast-${type}`;
+    toast.textContent = message;
+    container.appendChild(toast);
+    requestAnimationFrame(() => toast.classList.add('show'));
+    setTimeout(() => {
+        toast.classList.remove('show');
+        setTimeout(() => toast.remove(), 200);
+    }, duration);
+};
+
+const readFileAsDataURL = (file) => {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(file);
+    });
+};
+
+const createCoverVersions = async (file) => {
+    const toDataUrl = await readFileAsDataURL(file);
+    const img = await new Promise((resolve, reject) => {
+        const image = new Image();
+        image.onload = () => resolve(image);
+        image.onerror = reject;
+        image.src = toDataUrl;
+    });
+
+    const build = (maxSize, quality = 0.75) => {
+        const canvas = document.createElement('canvas');
+        const scale = Math.min(maxSize / img.width, maxSize / img.height, 1);
+        canvas.width = Math.max(1, Math.floor(img.width * scale));
+        canvas.height = Math.max(1, Math.floor(img.height * scale));
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+        return canvas.toDataURL('image/jpeg', quality);
+    };
+
+    return {
+        thumb: build(360, 0.7),
+        full: build(1200, 0.82)
+    };
+};
+
+const bytesFromDataUrl = (dataUrl = '') => {
+    const base64 = dataUrl.split(',')[1] || '';
+    return Math.floor((base64.length * 3) / 4);
+};
 
 const downloadCurrentSong = async () => {
-    const currentSong = SONGS[currentSongIndex];
+    let currentSong = songs[currentSongIndex];
     if (!currentSong) return;
+
+    if (!currentSong.audio) {
+        try {
+            currentSong = await ensureSongMedia(currentSongIndex);
+        } catch (err) {
+            showToast('No se pudo cargar el audio para descargar.', 'error');
+            return;
+        }
+    }
 
     try {
         
@@ -149,7 +230,7 @@ const downloadCurrentSong = async () => {
         
     } catch (error) {
         console.error('Error al descargar la canción:', error);
-        alert('No se pudo descargar la canción. Intenta de nuevo más tarde.');
+        showToast('No se pudo descargar la canción. Intenta de nuevo más tarde.', 'error');
         
         
         const downloadBtn = document.getElementById('download-btn');
@@ -159,9 +240,6 @@ const downloadCurrentSong = async () => {
         }
     }
 };
-
-
-window.downloadCurrentSong = downloadCurrentSong;
 
 const requestUsername = (suggested = '') => {
     return new Promise((resolve) => {
@@ -234,7 +312,7 @@ const handleLogin = async () => {
         }
     } catch (err) {
         console.error('Error al iniciar sesión:', err);
-        alert('No se pudo iniciar sesión. Intenta de nuevo.');
+        showToast('No se pudo iniciar sesión. Intenta de nuevo.', 'error');
     }
 };
 
@@ -284,9 +362,10 @@ const setupFirebaseAuth = () => {
             currentUser = null;
         }
         updateUserUI();
+        updateUploadButton();
+        subscribeSongs();
     });
 };
-
 
 const saveToLocalStorage = (key, data) => {
     localStorage.setItem(key, JSON.stringify(data));
@@ -295,6 +374,27 @@ const saveToLocalStorage = (key, data) => {
 const loadFromLocalStorage = (key, defaultValue = []) => {
     const data = localStorage.getItem(key);
     return data ? JSON.parse(data) : defaultValue;
+};
+
+const loadPendingUploads = () => {
+    pendingUploads = loadFromLocalStorage(PENDING_UPLOADS_KEY, []);
+};
+
+const savePendingUploads = () => {
+    saveToLocalStorage(PENDING_UPLOADS_KEY, pendingUploads);
+};
+
+const addPendingUpload = (item) => {
+    pendingUploads.push(item);
+    savePendingUploads();
+};
+
+const removePendingUpload = (id) => {
+    const before = pendingUploads.length;
+    pendingUploads = pendingUploads.filter(p => p.id !== id);
+    if (pendingUploads.length !== before) {
+        savePendingUploads();
+    }
 };
 
 const formatTime = (seconds) => {
@@ -329,10 +429,97 @@ const slideIn = (element, direction = 'up', duration = 300) => {
     });
 };
 
+const injectStyles = () => {
+    const style = document.createElement('style');
+    style.textContent = `
+    .toast-container {
+        position: fixed;
+        top: 20px;
+        right: 20px;
+        display: flex;
+        flex-direction: column;
+        gap: 10px;
+        z-index: 9999;
+        pointer-events: none;
+    }
+    .toast {
+        background: rgba(20, 20, 20, 0.9);
+        color: #fff;
+        padding: 12px 16px;
+        border-radius: 10px;
+        box-shadow: 0 10px 40px rgba(0,0,0,0.35);
+        transform: translateY(-8px);
+        opacity: 0;
+        transition: all 180ms ease;
+        pointer-events: auto;
+        font-size: 14px;
+    }
+    .toast.show { opacity: 1; transform: translateY(0); }
+    .toast-info { border-left: 4px solid #4aa3ff; }
+    .toast-success { border-left: 4px solid #4cd964; }
+    .toast-error { border-left: 4px solid #ff4757; }
+    .upload-btn.disabled { opacity: 0.6; cursor: not-allowed; }
+    .upload-btn {
+        background: #16a34a;
+        color: #fff;
+        border: none;
+        padding: 10px 16px;
+        border-radius: 14px;
+        font-weight: 700;
+        letter-spacing: 0.3px;
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        box-shadow: 0 8px 18px rgba(22,163,74,0.28);
+    }
+    .upload-btn .fa-cloud-upload-alt { font-size: 14px; }
+    .modal-content {
+        background: linear-gradient(145deg, rgba(20,22,30,0.9), rgba(34,36,48,0.92));
+        border: 1px solid rgba(255,255,255,0.06);
+        box-shadow: 0 18px 60px rgba(0,0,0,0.4);
+    }
+    .modal-input, .modal-label {
+        color: #e8e8e8;
+    }
+    .modal-label {
+        font-size: 13px;
+        font-weight: 600;
+        margin-top: 8px;
+        opacity: 0.9;
+    }
+    .modal-hint {
+        font-size: 12px;
+        color: #b8b8b8;
+        margin-top: 6px;
+    }
+    .pill-info {
+        background: rgba(74,163,255,0.12);
+        color: #dceeff;
+        padding: 8px 12px;
+        border-radius: 10px;
+        font-size: 13px;
+        display: inline-flex;
+        align-items: center;
+        gap: 8px;
+        border: 1px solid rgba(74,163,255,0.2);
+        margin-bottom: 8px;
+    }
+    .modal-warning {
+        background: rgba(255, 87, 87, 0.12);
+        color: #ffcdd2;
+        border: 1px solid rgba(255, 87, 87, 0.3);
+        padding: 10px 12px;
+        border-radius: 10px;
+        font-size: 13px;
+        margin-top: 6px;
+        display: flex;
+        gap: 8px;
+        align-items: center;
+    }
+    `;
+    document.head.appendChild(style);
+};
 
-const injectStyles = () => {};
-
-// Sidebr
 const openSidebar = () => {
     document.body.classList.add('sidebar-open');
     document.body.classList.remove('sidebar-closed');
@@ -359,7 +546,6 @@ const syncSidebarState = () => {
     }
 };
 
-// Audio
 const initPlayer = () => {
     const audio = new Audio();
     currentAudio = audio;
@@ -370,8 +556,42 @@ const initPlayer = () => {
     return audio;
 };
 
-const playSong = (songIndex) => {
-    const song = SONGS[songIndex];
+const ensureSongMedia = async (songIndex) => {
+    const song = songs[songIndex];
+    if (!song || song.audio) return song;
+
+    if (mediaCache.has(song.id)) {
+        const cached = mediaCache.get(song.id);
+        songs[songIndex] = { ...song, ...cached };
+        return songs[songIndex];
+    }
+
+    const services = window.firebaseServices || {};
+    const { db, ref, get } = services;
+    if (!db || !ref || !get) throw new Error('Firebase no disponible');
+
+    const snap = await get(ref(db, `${SONGS_MEDIA_PATH}/${song.id}`));
+    if (!snap.exists()) throw new Error('Audio no encontrado');
+    const media = snap.val();
+    const merged = { ...song, audio: media.audio, cover: media.coverFull || song.cover };
+    mediaCache.set(song.id, { audio: merged.audio, cover: merged.cover });
+    songs[songIndex] = merged;
+    return merged;
+};
+
+const playSong = async (songIndex) => {
+    let song = songs[songIndex];
+    if (!song) return;
+    
+    try {
+        if (!song.audio) {
+            song = await ensureSongMedia(songIndex);
+        }
+    } catch (err) {
+        showToast('No se pudo cargar el audio.', 'error');
+        console.error(err);
+        return;
+    }
     
     if (!currentAudio) {
         initPlayer();
@@ -388,7 +608,7 @@ const playSong = (songIndex) => {
         addToRecent(song);
         updateMiniPlayer();
     }).catch(error => {
-        console.error('Error al reproducir:', error);
+        console.warn('Error al reproducir (ignorado):', error);
     });
     
     currentSongIndex = songIndex;
@@ -411,12 +631,14 @@ const togglePlayPause = () => {
 };
 
 const playNextSong = () => {
-    const nextIndex = (currentSongIndex + 1) % SONGS.length;
+    if (songs.length === 0) return;
+    const nextIndex = (currentSongIndex + 1) % songs.length;
     playSong(nextIndex);
 };
 
 const playPrevSong = () => {
-    const prevIndex = (currentSongIndex - 1 + SONGS.length) % SONGS.length;
+    if (songs.length === 0) return;
+    const prevIndex = (currentSongIndex - 1 + songs.length) % songs.length;
     playSong(prevIndex);
 };
 
@@ -450,7 +672,8 @@ const seekSong = (e) => {
 };
 
 const updatePlayerUI = (songIndex) => {
-    const song = SONGS[songIndex];
+    const song = songs[songIndex];
+    if (!song) return;
     const playerCover = document.querySelector('.player-cover');
     const playerTitle = document.querySelector('.player-title');
     const playerArtist = document.querySelector('.player-artist');
@@ -501,12 +724,11 @@ const updateMiniPlayer = () => {
     }
 };
 
-
 const toggleFavorite = (songId) => {
     const index = favorites.findIndex(fav => fav.id === songId);
     
     if (index === -1) {
-        const song = SONGS.find(s => s.id === songId);
+        const song = songs.find(s => s.id === songId);
         if (song) {
             favorites.push(song);
         }
@@ -515,7 +737,7 @@ const toggleFavorite = (songId) => {
     }
     
     saveToLocalStorage('favorites', favorites);
-    renderSongs(SONGS, currentView);
+    renderSongs(songs, currentView);
     
     if (currentView === 'favorites') {
         renderSongs(favorites, 'favorites');
@@ -542,7 +764,7 @@ const createPlaylist = (name) => {
 
 const addToPlaylist = (playlistId, songId) => {
     const playlist = playlists.find(p => p.id === playlistId);
-    const song = SONGS.find(s => s.id === songId);
+    const song = songs.find(s => s.id === songId);
     
     if (playlist && song && !playlist.songs.some(s => s.id === songId)) {
         playlist.songs.push(song);
@@ -729,7 +951,7 @@ const renderSongCard = (song, viewType = 'home') => {
     
     div.addEventListener('click', (e) => {
         if (!e.target.closest('.song-actions')) {
-            const index = SONGS.findIndex(s => s.id === song.id);
+            const index = songs.findIndex(s => s.id === song.id);
             playSong(index);
         }
     });
@@ -852,7 +1074,7 @@ const renderHome = () => {
     const allSongsSection = document.getElementById('all-songs-section');
     const allSongsGrid = document.createElement('div');
     allSongsGrid.className = 'songs-grid';
-    SONGS.forEach(song => {
+    songs.forEach(song => {
         allSongsGrid.appendChild(renderSongCard(song, 'home'));
     });
     allSongsSection.appendChild(allSongsGrid);
@@ -942,6 +1164,7 @@ const initApp = () => {
     favorites = loadFromLocalStorage('favorites', []);
     recentSongs = loadFromLocalStorage('recentSongs', []);
     playlists = loadFromLocalStorage('playlists', []);
+    loadPendingUploads();
     currentUser = null;
     
     document.body.innerHTML = '';
@@ -983,6 +1206,9 @@ const initApp = () => {
                 <div class="search-bar">
                     <input type="text" class="search-input" placeholder="Buscar canciones, artistas...">
                 </div>
+                <button class="upload-btn glass" id="upload-btn">
+                    <i class="fas fa-cloud-upload-alt"></i> Subir música
+                </button>
             </div>
             <div class="user-section" id="user-section">
                 <!-- Aquí se carga la info del usuario -->
@@ -998,10 +1224,10 @@ const initApp = () => {
         <!-- Player principal -->
         <footer class="player glass">
             <div class="player-info">
-                <img src="${SONGS[0].cover}" alt="Cover" class="player-cover">
+                <img src="${songs[0]?.cover || LOGO_URL}" alt="Cover" class="player-cover">
                 <div class="player-text">
-                    <div class="player-title">${SONGS[0].title}</div>
-                    <div class="player-artist">${SONGS[0].artist}</div>
+                    <div class="player-title">${songs[0]?.title || 'Lista vacía'}</div>
+                    <div class="player-artist">${songs[0]?.artist || ''}</div>
                 </div>
             </div>
             
@@ -1039,10 +1265,10 @@ const initApp = () => {
         <!-- Mini player flotante -->
         <div class="mini-player glass">
             <div style="display: flex; align-items: center; gap: 12px;">
-                <img src="${SONGS[0].cover}" alt="Cover" style="width: 40px; height: 40px; border-radius: 8px;">
+                <img src="${songs[0]?.cover || LOGO_URL}" alt="Cover" style="width: 40px; height: 40px; border-radius: 8px;">
                 <div>
-                    <div style="font-size: 14px; font-weight: 600;">${SONGS[0].title}</div>
-                    <div style="font-size: 12px; color: #b3b3b3;">${SONGS[0].artist}</div>
+                    <div style="font-size: 14px; font-weight: 600;">${songs[0]?.title || 'Sin canciones'}</div>
+                    <div style="font-size: 12px; color: #b3b3b3;">${songs[0]?.artist || ''}</div>
                 </div>
                 <button class="control-btn" onclick="togglePlayPause()" style="margin-left: auto;">
                     <i class="fas fa-play"></i>
@@ -1089,7 +1315,7 @@ const setupEventListeners = () => {
         searchInput.addEventListener('input', (e) => {
             const searchTerm = e.target.value.toLowerCase();
             if (searchTerm.length > 2) {
-                const filteredSongs = SONGS.filter(song => 
+                const filteredSongs = songs.filter(song => 
                     song.title.toLowerCase().includes(searchTerm) || 
                     song.artist.toLowerCase().includes(searchTerm)
                 );
@@ -1099,6 +1325,8 @@ const setupEventListeners = () => {
             }
         });
     }
+
+    updateUploadButton();
 
     document.addEventListener('click', (e) => {
         const dropdown = document.querySelector('.user-dropdown');
@@ -1116,6 +1344,235 @@ const toggleUserMenu = (event) => {
     if (dropdown) {
         dropdown.classList.toggle('active');
     }
+};
+
+const updateUploadButton = () => {
+    const uploadBtn = document.getElementById('upload-btn');
+    if (!uploadBtn) return;
+    if (currentUser) {
+        uploadBtn.classList.remove('disabled');
+        uploadBtn.innerHTML = '<i class="fas fa-cloud-upload-alt"></i> Subir música';
+        uploadBtn.onclick = openUploadModal;
+    } else {
+        uploadBtn.classList.add('disabled');
+        uploadBtn.innerHTML = '<i class="fas fa-cloud-upload-alt"></i> Inicia sesión para subir';
+        uploadBtn.onclick = () => {
+            showToast('Debes iniciar sesión para subir tu música.', 'error');
+            handleLogin();
+        };
+    }
+};
+
+const closeUploadModal = () => {
+    if (pendingUploadModal) {
+        pendingUploadModal.classList.remove('active');
+        setTimeout(() => {
+            pendingUploadModal?.remove();
+            pendingUploadModal = null;
+            pendingUploadSubmit = false;
+        }, 250);
+    }
+};
+
+const fileToDataURL = (file) => {
+    return new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result);
+        reader.onerror = () => reject(reader.error);
+        reader.readAsDataURL(file);
+    });
+};
+
+const submitUploadSong = async () => {
+    if (pendingUploadSubmit) return;
+    if (!currentUser) {
+        showToast('Debes iniciar sesión para subir tu música.', 'error');
+        handleLogin();
+        return;
+    }
+    const titleInput = document.getElementById('upload-title');
+    const artistInput = document.getElementById('upload-artist');
+    const audioInput = document.getElementById('upload-audio');
+    const coverInput = document.getElementById('upload-cover');
+    if (!titleInput || !artistInput || !audioInput || !coverInput) return;
+
+    const title = (titleInput.value || '').trim();
+    const artist = (artistInput.value || '').trim();
+    const audioFile = audioInput.files?.[0];
+    const coverFile = coverInput.files?.[0];
+
+    if (!title || !artist) {
+        showToast('Agrega el nombre de la canción y del autor.', 'error');
+        return;
+    }
+    if (!audioFile) {
+        showToast('Debes seleccionar un archivo .mp3', 'error');
+        return;
+    }
+    if (!coverFile) {
+        showToast('Debes seleccionar una imagen de portada.', 'error');
+        return;
+    }
+    if (!audioFile.type.includes('audio')) {
+        showToast('El archivo de audio debe ser .mp3', 'error');
+        return;
+    }
+    if (audioFile.size > MAX_AUDIO_MB * 1024 * 1024) {
+        showToast(`El audio no debe superar ${MAX_AUDIO_MB}MB`, 'error');
+        return;
+    }
+
+    pendingUploadSubmit = true;
+    const submitBtn = document.getElementById('upload-submit');
+    if (submitBtn) {
+        submitBtn.disabled = true;
+        submitBtn.innerHTML = '<i class="fas fa-spinner fa-spin"></i> Subiendo...';
+    }
+
+    showToast('Tu música se subirá en segundo plano. Puedes seguir navegando.', 'info', 4000);
+
+    closeUploadModal();
+
+    try {
+        const [audioData, coverVersions] = await Promise.all([
+            readFileAsDataURL(audioFile),
+            createCoverVersions(coverFile)
+        ]);
+
+        if (bytesFromDataUrl(audioData) > MAX_AUDIO_MB * 1024 * 1024) {
+            throw new Error(`El audio supera ${MAX_AUDIO_MB}MB`);
+        }
+
+        const { db, ref, push, set, update } = window.firebaseServices || {};
+        if (!db || !ref || !push || !set || !update) {
+            throw new Error('Firebase no está listo.');
+        }
+
+        const metaRef = push(ref(db, SONGS_META_PATH));
+        const id = metaRef.key;
+
+        const metaPayload = {
+            title,
+            artist,
+            cover: coverVersions.thumb,
+            uploaderUid: currentUser.uid,
+            uploaderName: currentUser.username || currentUser.displayName || 'Anónimo',
+            createdAt: Date.now(),
+            status: PROCESSING_STATUS
+        };
+        const mediaPayload = {
+            audio: audioData,
+            coverFull: coverVersions.full
+        };
+
+        addPendingUpload({ id, title, createdAt: metaPayload.createdAt });
+
+        await Promise.all([
+            set(metaRef, metaPayload),
+            set(ref(db, `${SONGS_MEDIA_PATH}/${id}`), mediaPayload)
+        ]);
+
+        await update(ref(db, `${SONGS_META_PATH}/${id}`), { status: READY_STATUS });
+
+        showToast('Tu música se publicó correctamente.', 'success');
+        closeUploadModal();
+    } catch (err) {
+        console.error('Error al subir música', err);
+        showToast(err?.message || 'No se pudo subir la música. Intenta de nuevo.', 'error');
+    } finally {
+        pendingUploadSubmit = false;
+        if (submitBtn) {
+            submitBtn.disabled = false;
+            submitBtn.innerHTML = 'Publicar';
+        }
+    }
+};
+
+const openUploadModal = () => {
+    if (!currentUser) {
+        showToast('Debes iniciar sesión para subir tu música.', 'error');
+        handleLogin();
+        return;
+    }
+
+    if (pendingUploadModal) {
+        closeUploadModal();
+    }
+
+    const modal = document.createElement('div');
+    modal.className = 'modal glass';
+    modal.innerHTML = `
+        <div class="modal-content glass" style="max-width: 520px;">
+            <h2 class="modal-title">Subir tu música</h2>
+            <div class="pill-info"><i class="fas fa-clock"></i> La subida seguirá en segundo plano. Te avisaremos cuando esté lista.</div>
+            <label class="modal-label">Nombre de la canción</label>
+            <input type="text" class="modal-input" id="upload-title" placeholder="Ej: Mi canción" required>
+            <label class="modal-label">Autor</label>
+            <input type="text" class="modal-input" id="upload-artist" placeholder="Tu nombre artístico" value="${currentUser.username || currentUser.displayName || ''}" required>
+            <label class="modal-label">Archivo de audio (.mp3)</label>
+            <input type="file" class="modal-input" id="upload-audio" accept=".mp3,audio/mpeg" required>
+            <label class="modal-label">Imagen de portada (logo)</label>
+            <input type="file" class="modal-input" id="upload-cover" accept="image/*" required>
+            <div class="modal-hint">El audio se procesará aunque cierres la pestaña. Peso máx ${MAX_AUDIO_MB}MB.</div>
+            <div class="modal-warning"><i class="fas fa-exclamation-triangle"></i>Si tu música contiene contenido sexual u ofensivo, un administrador podrá eliminarla.</div>
+            <div class="modal-buttons">
+                <button class="modal-btn btn-secondary" id="upload-cancel">Cancelar</button>
+                <button class="modal-btn btn-primary" id="upload-submit">Publicar</button>
+            </div>
+        </div>
+    `;
+
+    document.body.appendChild(modal);
+    pendingUploadModal = modal;
+    setTimeout(() => modal.classList.add('active'), 10);
+
+    modal.querySelector('#upload-cancel')?.addEventListener('click', closeUploadModal);
+    modal.querySelector('#upload-submit')?.addEventListener('click', submitUploadSong);
+};
+
+const refreshSongsView = () => {
+    navigateTo(currentView);
+};
+
+const subscribeSongs = () => {
+    const services = window.firebaseServices || {};
+    const { db, ref, onValue } = services;
+    if (!db || !ref || !onValue) return;
+
+    if (songsUnsubscribe) {
+        songsUnsubscribe();
+    }
+
+    const songsRef = ref(db, SONGS_META_PATH);
+    songsUnsubscribe = onValue(songsRef, (snapshot) => {
+        const data = snapshot.val() || {};
+        const dynamicSongs = Object.entries(data).map(([id, song]) => ({
+            id,
+            ...song,
+            cover: song.cover || LOGO_URL
+        })).sort((a, b) => (b.createdAt || 0) - (a.createdAt || 0));
+
+        dynamicSongs.forEach((song) => {
+            lastStatusMap[song.id] = song.status || READY_STATUS;
+            if (song.status === READY_STATUS && pendingUploads.some(p => p.id === song.id)) {
+                showToast(`"${song.title}" ya está publicada.`, 'success');
+                removePendingUpload(song.id);
+                lastStatusMap[song.id] = 'notified';
+            }
+        });
+
+        songs = [...PRESET_SONGS, ...dynamicSongs];
+
+        if (currentSongIndex >= songs.length) {
+            currentSongIndex = 0;
+        }
+
+        refreshSongsView();
+        updatePlayerUI(currentSongIndex);
+    }, (error) => {
+        console.error('Error al escuchar canciones en tiempo real', error);
+        showToast('Error al actualizar canciones en vivo.', 'error');
+    });
 };
 
 

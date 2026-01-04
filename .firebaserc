@@ -1,5 +1,15 @@
 {
   "projects": {
     "default": "studio-5824860134-cb96e"
-  }
+  },
+  "targets": {
+    "studio-5824860134-cb96e": {
+      "hosting": {
+        "sorexmusic-site": [
+          "sorexmusic"
+        ]
+      }
+    }
+  },
+  "etags": {}
 }
